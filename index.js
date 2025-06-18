@@ -1,8 +1,8 @@
 const express = require('express');
 const app = express();
 const port = process.env.PORT || 5000;
-app.get('/', (req, res) => res.send('Bot is running!'));
-app.listen(port, () => console.log('Web server running'));
+app.get('/', (req, res) => res.send('Bazzao Bot is running!'));
+app.listen(port, () => console.log('✅ Bazzao Bot is Online!'));
 
 require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
@@ -28,17 +28,14 @@ const musicQueues = new Map();
 class MusicQueue {
     constructor() {
         this.songs = []; // Current queue
-        this.history = []; // History of played songs
         this.connection = null;
         this.player = null;
         this.isPlaying = false;
         this.currentChannel = null;
-        this.loopMode = 'off'; // off, song, queue
-        this.nowPlayingMessage = null;
-        this.volume = 100;
         this.updateInterval = null; // For progress bar updates
         this.startTime = null; // Track when song started
         this.idleHandler = null; // Store idle handler reference
+        this.nowPlayingMessage = null; // Current now playing message
     }
 }
 
@@ -65,19 +62,17 @@ client.on('messageCreate', async message => {
     switch (command) {
         case 'p':
         case 'play':
+            if (queue.idleTimeout) {
+                clearTimeout(queue.idleTimeout);
+                queue.idleTimeout = null;
+            }
             await handlePlay(message, queue, args.join(' '));
             break;
         case 'stop':
             await handleStop(message, queue);
             break;
-        case 'skip':
-            await handleSkip(message, queue);
-            break;
         case 'queue':
             await handleQueue(message, queue);
-            break;
-        case 'help':
-            await handleHelp(message);
             break;
         case 'pause':
             await handlePause(message, queue);
@@ -85,23 +80,15 @@ client.on('messageCreate', async message => {
         case 'resume':
             await handleResume(message, queue);
             break;
-        case 'loop':
-            await handleLoop(message, queue, args[0]);
-            break;
-        case 'volume':
-            await handleVolume(message, queue, args[0]);
-            break;
     }
 });
 
 // Handle button interactions
 client.on('interactionCreate', async interaction => {
     if (!interaction.isButton()) return;
-
     const guildId = interaction.guild.id;
     const queue = musicQueues.get(guildId);
     if (!queue) return;
-
     const customId = interaction.customId;
     await interaction.deferUpdate();
 
@@ -120,9 +107,50 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
+// Function to clear the now playing message
+function clearNowPlayingMessage(queue) {
+    if (queue.nowPlayingMessage) {
+        try {
+            queue.nowPlayingMessage.delete().catch(console.error);
+        } catch (error) {
+            console.error('Error deleting now playing message:', error);
+        }
+        queue.nowPlayingMessage = null;
+    }
+}
+
+// Function to show queue ended card
+async function showQueueEndedCard(queue) {
+    if (!queue.currentChannel) return;
+
+    // Clear progress updates
+    if (queue.updateInterval) {
+        clearInterval(queue.updateInterval);
+        queue.updateInterval = null;
+    }
+
+    const endedEmbed = new EmbedBuilder()
+        .setColor('#2c0464')
+        .setTitle('🎶 Queue Ended')
+        .setDescription('The music queue has finished. Add more songs to keep the party going! 🥳')
+        .setFooter({ text: `Use ${PREFIX}play <song name> to add more music!` });
+
+    try {
+        // Clear existing now playing message
+        clearNowPlayingMessage(queue);
+
+        // Create new ended card message without buttons
+        queue.nowPlayingMessage = await queue.currentChannel.send({
+            embeds: [endedEmbed]
+        });
+    } catch (error) {
+        console.error('Error showing queue ended card:', error);
+    }
+}
+
 async function handlePlay(message, queue, query) {
     if (!query) {
-        return message.reply('Please provide a song name! Example: `-play never gonna give you up`');
+        return message.reply('Please provide a song name! Example: `#play never gonna give you up`');
     }
 
     const voiceChannel = message.member.voice.channel;
@@ -186,39 +214,28 @@ async function handlePlay(message, queue, query) {
             queue.connection.subscribe(queue.player);
 
             // Create idle handler
-            const idleHandler = () => {
-                // Clear progress bar updates
+            const idleHandler = async () => {
                 if (queue.updateInterval) {
                     clearInterval(queue.updateInterval);
                     queue.updateInterval = null;
                 }
 
-                // Only process if still connected
                 if (!queue.connection) return;
 
-                // Handle different loop modes
-                if (queue.loopMode === 'song') {
-                    // Replay same song without removing it
-                    playNextSong(queue);
+                // Clear current now playing message
+                clearNowPlayingMessage(queue);
+
+                const playedSong = queue.songs.shift();
+                if (queue.songs.length > 0) {
+                    await playNextSong(queue);
                 } else {
-                    // Move current song to history
-                    const playedSong = queue.songs.shift();
-                    if (playedSong) {
-                        queue.history.push(playedSong);
-                    }
+                    queue.isPlaying = false;
+                    await showQueueEndedCard(queue);
 
-                    // Add back to end if queue looping
-                    if (queue.loopMode === 'queue' && playedSong) {
-                        queue.songs.push(playedSong);
-                    }
-
-                    // Play next if songs remain
-                    if (queue.songs.length > 0) {
-                        playNextSong(queue);
-                    } else {
-                        // Stop if no songs left
+                    // Delay disconnect by 2 minutes
+                    queue.idleTimeout = setTimeout(() => {
                         handleStop(null, queue);
-                    }
+                    }, 2 * 60 * 1000);
                 }
             };
 
@@ -237,7 +254,7 @@ async function handlePlay(message, queue, query) {
         }
 
         if (!queue.isPlaying) {
-            playNextSong(queue);
+            await playNextSong(queue);
             loadingMessage.edit(`✅ Now playing: **${song.title}**`);
         } else {
             loadingMessage.edit(`✅ Added to queue: **${song.title}**`);
@@ -249,6 +266,12 @@ async function handlePlay(message, queue, query) {
 }
 
 async function playNextSong(queue) {
+    // Clear progress bar updates from previous song
+    if (queue.updateInterval) {
+        clearInterval(queue.updateInterval);
+        queue.updateInterval = null;
+    }
+
     if (queue.songs.length === 0 || !queue.connection) {
         queue.isPlaying = false;
         return;
@@ -294,14 +317,17 @@ async function playNextSong(queue) {
             });
 
             // Set volume
-            resource.volume.setVolume(queue.volume / 100);
+            resource.volume.setVolume(1); // Fixed at 100% volume
 
             queue.player.play(resource);
             queue.isPlaying = true;
             queue.startTime = Date.now(); // Track start time
 
-            // Create or update now playing message
-            updateNowPlayingMessage(queue);
+            // Clear previous now playing message
+            clearNowPlayingMessage(queue);
+
+            // Create new now playing message
+            await updateNowPlayingMessage(queue);
 
             // Start progress bar updates
             startProgressBarUpdates(queue);
@@ -341,10 +367,7 @@ function skipSong(queue) {
     }
 
     // Remove current song
-    const skippedSong = queue.songs.shift();
-    if (skippedSong) {
-        queue.history.push(skippedSong);
-    }
+    queue.songs.shift();
 
     // Play next song if available
     if (queue.songs.length > 0) {
@@ -362,95 +385,71 @@ function startProgressBarUpdates(queue) {
     }
 
     // Set up a new interval to update the progress bar every 5 seconds
-    queue.updateInterval = setInterval(() => {
+    queue.updateInterval = setInterval(async () => {
         if (queue.player && queue.player.state.status === AudioPlayerStatus.Playing) {
-            updateNowPlayingMessage(queue);
+            try {
+                await updateNowPlayingMessage(queue);
+            } catch (error) {
+                console.error('Progress bar update error:', error);
+            }
         }
     }, 5000);
 }
 
 async function updateNowPlayingMessage(queue) {
-    if (queue.songs.length === 0 || !queue.player || !queue.currentChannel) return;
+    if (!queue.currentChannel || queue.songs.length === 0) return;
 
     const song = queue.songs[0];
-
-    // Calculate current position
     let position = 0;
-    if (queue.player.state.status === AudioPlayerStatus.Playing) {
-        // Use playbackDuration for accurate position
+    if (queue.player?.state.status === AudioPlayerStatus.Playing) {
         position = queue.player.state.playbackDuration / 1000;
     } else if (queue.startTime) {
-        // Fallback to time-based calculation if needed
         position = (Date.now() - queue.startTime) / 1000;
     }
 
+    const progressBarLength = 20;
+    const progress = Math.min(1, position / song.duration);
+    const progressPosition = Math.floor(progress * progressBarLength);
+    const progressBar = '─'.repeat(progressBarLength);
+    const progressBarWithMarker = `${progressBar.substring(0, progressPosition)}🔹${progressBar.substring(progressPosition + 1)}`;
+
     const embed = new EmbedBuilder()
-        .setColor(0x3498db)
-        .setTitle('Now Playing')
-        .setDescription(`**${song.title}**`)
+        .setColor('#2e085b')
+        .setTitle(`🎵 Now Playing`)
+        .setDescription(`**[${song.title}](${song.url})**`)
         .setThumbnail(song.thumbnail)
         .addFields(
-            {
-                name: 'Duration',
-                value: `${formatDuration(position)} / ${formatDuration(song.duration)}`,
-                inline: true
-            },
-            {
-                name: 'Requested by',
-                value: song.requestedBy,
-                inline: true
-            },
+            { name: '⏱️ Time', value: `\`${formatDuration(position)} / ${formatDuration(song.duration)}\``, inline: true },
+            { name: '🙋 Requested by', value: song.requestedBy, inline: true },
+            { name: 'Progress', value: progressBarWithMarker, inline: false },
         )
-        .setFooter({
-            text: `${queue.songs.length} song${queue.songs.length > 1 ? 's' : ''} in queue | ${queue.history.length} in history | Loop: ${queue.loopMode}`
-        });
+        .setFooter({ text: `🎧 Enjoy your music!` });
 
-    // Progress bar
-    const progressBarLength = 15;
-    const progress = Math.min(1, position / song.duration);
-    const progressBar = '▬'.repeat(progressBarLength);
-    const progressPosition = Math.floor(progress * progressBarLength);
-    const progressBarWithMarker = progressBar.substring(0, progressPosition) +
-        '🔘' +
-        progressBar.substring(progressPosition + 1);
-
-    embed.addFields({
-        name: 'Progress',
-        value: progressBarWithMarker,
-        inline: false
-    });
-
-    // Control buttons
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
             .setCustomId('pause_resume')
-            .setEmoji(queue.player.state.status === AudioPlayerStatus.Playing ? '⏸️' : '▶️')
+            .setEmoji(queue.player?.state.status === AudioPlayerStatus.Playing ? '⏸️' : '▶️')
             .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
             .setCustomId('stop')
             .setEmoji('⏹️')
-            .setStyle(ButtonStyle.Secondary),
+            .setStyle(ButtonStyle.Secondary)
     );
 
-    if (queue.nowPlayingMessage) {
-        try {
-            await queue.nowPlayingMessage.edit({
-                embeds: [embed],
-                components: [row]
-            });
-        } catch (error) {
-            console.error('Error updating now playing message:', error);
-            // Send a new message if editing fails
-            queue.nowPlayingMessage = await queue.currentChannel.send({
-                embeds: [embed],
-                components: [row]
-            });
+    try {
+        if (queue.nowPlayingMessage) {
+            await queue.nowPlayingMessage.edit({ embeds: [embed], components: [row] });
+        } else {
+            queue.nowPlayingMessage = await queue.currentChannel.send({ embeds: [embed], components: [row] });
         }
-    } else {
-        queue.nowPlayingMessage = await queue.currentChannel.send({
-            embeds: [embed],
-            components: [row]
-        });
+    } catch (error) {
+        console.error('Error updating now playing message:', error);
+        // Attempt to create a new message if editing fails
+        try {
+            queue.nowPlayingMessage = await queue.currentChannel.send({ embeds: [embed], components: [row] });
+        } catch (err) {
+            console.error('Failed to create new now playing message:', err);
+        }
     }
 }
 
@@ -458,6 +457,11 @@ async function handleStop(message, queue) {
     if (!queue.connection) {
         if (message) message.reply('❌ No music is currently playing!');
         return;
+    }
+
+    // Show ended card only if stopping during playback
+    if (queue.isPlaying || queue.songs.length > 0) {
+        await showQueueEndedCard(queue);
     }
 
     // Clear progress bar updates
@@ -485,77 +489,16 @@ async function handleStop(message, queue) {
 
     // Reset queue state
     queue.songs = [];
-    queue.history = [];
     queue.isPlaying = false;
     queue.startTime = null;
-    queue.loopMode = 'off';
 
-    // Delete now playing message
-    if (queue.nowPlayingMessage) {
-        try {
-            await queue.nowPlayingMessage.delete();
-        } catch (error) {
-            console.error('Error deleting now playing message:', error);
-        }
-        queue.nowPlayingMessage = null;
+    // Clear idle timeout if exists
+    if (queue.idleTimeout) {
+        clearTimeout(queue.idleTimeout);
+        queue.idleTimeout = null;
     }
 
     if (message) message.reply('⏹️ Music stopped and bot disconnected!');
-}
-
-async function handleSkip(message, queue) {
-    if (!queue.player || queue.songs.length === 0) {
-        if (message) message.reply('❌ No song to skip!');
-        return;
-    }
-
-    // Clear progress bar updates
-    if (queue.updateInterval) {
-        clearInterval(queue.updateInterval);
-        queue.updateInterval = null;
-    }
-
-    // Remove idle handler temporarily to prevent conflicts
-    if (queue.idleHandler && queue.player) {
-        queue.player.off(AudioPlayerStatus.Idle, queue.idleHandler);
-    }
-
-    // Stop current playback
-    queue.player.stop();
-
-    // Remove current song
-    const skippedSong = queue.songs.shift();
-    if (skippedSong) {
-        queue.history.push(skippedSong);
-    }
-
-    if (queue.songs.length > 0) {
-        // Play next song
-        playNextSong(queue);
-        if (message) {
-            if (message.reply) {
-                message.reply(`⏭️ Skipped **${skippedSong.title}**`);
-            } else if (message.channel) {
-                // Handle interaction response
-                message.channel.send(`⏭️ Skipped **${skippedSong.title}**`);
-            }
-        }
-    } else {
-        // Stop the bot if no more songs
-        handleStop(null, queue);
-        if (message) {
-            if (message.reply) {
-                message.reply('⏭️ Skipped and stopped because queue is empty.');
-            } else if (message.channel) {
-                message.channel.send('⏭️ Skipped and stopped because queue is empty.');
-            }
-        }
-    }
-
-    // Reattach idle handler
-    if (queue.idleHandler && queue.player) {
-        queue.player.on(AudioPlayerStatus.Idle, queue.idleHandler);
-    }
 }
 
 async function handlePause(message, queue) {
@@ -580,40 +523,6 @@ async function handleResume(message, queue) {
     updateNowPlayingMessage(queue);
 }
 
-async function handleLoop(message, queue, mode) {
-    const validModes = ['off', 'song', 'queue'];
-    if (!mode || !validModes.includes(mode)) {
-        return message.reply('❌ Please specify loop mode: `off`, `song`, or `queue`');
-    }
-
-    queue.loopMode = mode;
-    message.reply(`🔁 Loop mode set to: **${mode}**`);
-    updateNowPlayingMessage(queue);
-}
-
-async function handleVolume(message, queue, volume) {
-    const newVolume = parseInt(volume);
-    if (isNaN(newVolume)) {
-        return message.reply('❌ Please provide a valid volume number!');
-    }
-
-    if (newVolume < 0 || newVolume > 200) {
-        return message.reply('❌ Volume must be between 0 and 200!');
-    }
-
-    queue.volume = newVolume;
-
-    // Apply to current resource if playing
-    if (queue.player && queue.player.state.status === AudioPlayerStatus.Playing) {
-        const resource = queue.player.state.resource;
-        if (resource && resource.volume) {
-            resource.volume.setVolume(newVolume / 100);
-        }
-    }
-
-    message.reply(`🔊 Volume set to: **${newVolume}%**`);
-}
-
 async function handleQueue(message, queue) {
     if (queue.songs.length === 0) {
         return message.reply('📭 The queue is empty!');
@@ -629,7 +538,7 @@ async function handleQueue(message, queue) {
             color: 0x3498db,
             title: '🎵 Current Queue',
             description: queueList,
-            footer: { text: `Total songs: ${queue.songs.length} | Loop: ${queue.loopMode}` }
+            footer: { text: `Total songs: ${queue.songs.length}` }
         }]
     });
 }
@@ -638,66 +547,6 @@ function formatDuration(seconds) {
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
-}
-
-async function handleHelp(message) {
-    const helpEmbed = {
-        color: 0x0099ff,
-        title: '🎵 Music Bot Commands',
-        description: 'Here are all the available commands:',
-        fields: [
-            {
-                name: `${PREFIX}play <song>`,
-                value: 'Play a song by name',
-                inline: false,
-            },
-            {
-                name: `${PREFIX}stop`,
-                value: 'Stop music and disconnect bot',
-                inline: true,
-            },
-            {
-                name: `${PREFIX}skip`,
-                value: 'Skip current song',
-                inline: true,
-            },
-            {
-                name: `${PREFIX}pause`,
-                value: 'Pause playback',
-                inline: true,
-            },
-            {
-                name: `${PREFIX}resume`,
-                value: 'Resume playback',
-                inline: true,
-            },
-            {
-                name: `${PREFIX}loop <off/song/queue>`,
-                value: 'Set loop mode',
-                inline: true,
-            },
-            {
-                name: `${PREFIX}volume <0-200>`,
-                value: 'Set playback volume',
-                inline: true,
-            },
-            {
-                name: `${PREFIX}queue`,
-                value: 'Show current queue',
-                inline: true,
-            },
-            {
-                name: `${PREFIX}help`,
-                value: 'Show this help message',
-                inline: true,
-            }
-        ],
-        footer: {
-            text: `Example: ${PREFIX}play never gonna give you up`,
-        },
-    };
-
-    message.reply({ embeds: [helpEmbed] });
 }
 
 client.login(process.env.BOT_TOKEN);
