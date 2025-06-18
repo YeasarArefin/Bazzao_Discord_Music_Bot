@@ -1,0 +1,2 @@
+buildCommand: ./render-build.sh && npm install
+startCommand: node index.js

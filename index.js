@@ -20,7 +20,7 @@ const client = new Client({
 });
 
 // Bot prefix
-const PREFIX = '-';
+const PREFIX = '#';
 
 // Store music queues and player states for each guild
 const musicQueues = new Map();
